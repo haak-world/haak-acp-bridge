@@ -1,7 +1,15 @@
 //! haak-acp-bridge — Bridges haakd's WebSocket to ACP protocol on stdio.
 //!
-//! Usage:
-//!   haak-acp-bridge [--url ws://localhost:5201] [--agent bala] [--db /path/to/haak.db]
+//! Zed settings.json:
+//!   "agent_servers": {
+//!     "haak": {
+//!       "type": "custom",
+//!       "command": "haak-acp-bridge",
+//!       "args": ["--url", "ws://127.0.0.1:5201"]
+//!     }
+//!   }
+//!
+//! Flags: --url <ws://host:port>  --agent <default-agent>  --db <haak.db path>
 
 use agent_client_protocol::{
     self as acp,
@@ -9,33 +17,49 @@ use agent_client_protocol::{
     schema::{
         AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Cost, InitializeRequest,
         InitializeResponse, ListSessionsRequest, ListSessionsResponse, MaybeUndefined,
-        NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-        ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
-        SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode,
-        SessionModeId, SessionModeState, SessionNotification, SessionResumeCapabilities,
-        PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-        SessionConfigKind, SessionConfigOption, SessionConfigSelect, SessionConfigSelectOption,
-        SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-        SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+        PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+        RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+        ResumeSessionResponse, SessionCapabilities, SessionConfigKind, SessionConfigOption,
+        SessionConfigSelect, SessionConfigSelectOption, SessionId, SessionInfo,
+        SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
+        SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+        ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     },
     Agent, ConnectionTo, Dispatch, Stdio,
 };
 use futures::channel::mpsc;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tungstenite::{connect, Message};
+
+// ── Per-session state ──
+
+struct SessionState {
+    haakd_id: String,
+    event_rx: mpsc::UnboundedReceiver<String>,
+    model: String,
+    agent: String,
+}
+
+// ── Bridge ──
 
 struct Bridge {
     url: String,
     db_path: Option<PathBuf>,
     ws_tx: StdMutex<Option<std::sync::mpsc::Sender<String>>>,
-    ws_rx: StdMutex<Option<mpsc::UnboundedReceiver<String>>>,
-    haakd_session_id: StdMutex<Option<String>>,
-    current_model: StdMutex<String>,
-    current_agent: StdMutex<String>,
+    /// Demuxed per-session event receivers, keyed by haakd session ID
+    sessions: StdMutex<HashMap<String, SessionState>>,
+    /// ACP SessionId → haakd session ID
+    session_map: StdMutex<HashMap<String, String>>,
+    /// Global event receiver for session.created (before we know the session ID)
+    global_rx: StdMutex<Option<mpsc::UnboundedReceiver<String>>>,
+    default_agent: String,
+    default_model: String,
 }
 
 impl Bridge {
@@ -44,24 +68,35 @@ impl Bridge {
             url: url.to_string(),
             db_path,
             ws_tx: StdMutex::new(None),
-            ws_rx: StdMutex::new(None),
-            haakd_session_id: StdMutex::new(None),
-            current_model: StdMutex::new("sonnet".to_string()),
-            current_agent: StdMutex::new(agent.to_string()),
+            sessions: StdMutex::new(HashMap::new()),
+            session_map: StdMutex::new(HashMap::new()),
+            global_rx: StdMutex::new(None),
+            default_agent: agent.to_string(),
+            default_model: "sonnet".to_string(),
         })
     }
 
     fn connect(&self) -> anyhow::Result<()> {
+        // Reject non-ws:// URLs — TLS requires tokio-tungstenite (future work)
+        if self.url.starts_with("wss://") || self.url.starts_with("https://") {
+            anyhow::bail!("TLS not supported yet — use ws:// URL. For remote access, use an SSH tunnel.");
+        }
+
         let (event_tx, event_rx) = mpsc::unbounded::<String>();
         let (write_tx, write_rx) = std::sync::mpsc::channel::<String>();
-        let ws_url = format!("{}/ws/session", self.url.replace("http", "ws"));
+        let ws_url = format!("{}/ws/session", self.url);
 
+        // Demux state: route events to per-session channels
+        let sessions_ref = Arc::new(StdMutex::new(HashMap::<String, mpsc::UnboundedSender<String>>::new()));
+        let sessions_demux = sessions_ref.clone();
+
+        // WS reader thread → demux by sessionId
         std::thread::spawn(move || {
-            eprintln!("[ws-thread] connecting to {ws_url}");
+            eprintln!("[ws] connecting to {ws_url}");
             let (mut ws, _) = match connect(&ws_url) {
-                Ok(pair) => { eprintln!("[ws-thread] connected"); pair }
+                Ok(pair) => { eprintln!("[ws] connected"); pair }
                 Err(e) => {
-                    eprintln!("[ws-thread] FAILED: {e}");
+                    eprintln!("[ws] FAILED: {e}");
                     let _ = event_tx.unbounded_send(json!({"type":"error","message":format!("{e}")}).to_string());
                     return;
                 }
@@ -73,7 +108,25 @@ impl Bridge {
                 match ws.read() {
                     Ok(msg) if msg.is_text() => {
                         let text = msg.to_text().map(|s| s.to_string()).unwrap_or_default();
-                        if event_tx.unbounded_send(text).is_err() { break; }
+                        // Try to route to per-session channel by sessionId
+                        let routed = if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                            if let Some(sid) = v.get("sessionId").and_then(|v| v.as_str()) {
+                                let sessions = sessions_demux.lock().unwrap();
+                                if let Some(tx) = sessions.get(sid) {
+                                    tx.unbounded_send(text.clone()).is_ok()
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        // Unrouted events go to global channel (for session.created)
+                        if !routed {
+                            let _ = event_tx.unbounded_send(text);
+                        }
                     }
                     Ok(msg) if msg.is_close() => break,
                     Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -83,12 +136,36 @@ impl Bridge {
                 while let Ok(payload) = write_rx.try_recv() {
                     let _ = ws.send(Message::text(payload));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(16));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            eprintln!("[ws] disconnected");
         });
 
         *self.ws_tx.lock().unwrap() = Some(write_tx);
-        *self.ws_rx.lock().unwrap() = Some(event_rx);
+        *self.global_rx.lock().unwrap() = Some(event_rx);
+
+        // Store the demux sender map so register_session can add channels
+        // We need a way for register_session to add senders to the demux map.
+        // Store it on the bridge:
+        // Actually, the demux map is in the WS thread. We need shared access.
+        // sessions_ref is already Arc<Mutex<HashMap>> — store it on Bridge.
+        // But Bridge is already constructed. Use a separate field.
+        // For now, store session channels directly and have the WS thread
+        // check them. We already have sessions_ref shared between the thread
+        // and the bridge — but we need to get it into the Bridge struct.
+        //
+        // Simpler approach: the global_rx gets ALL events. The session handlers
+        // take events from their own channel. We register per-session senders
+        // in the demux map before sending session.create.
+
+        // Store the demux sender map for register_session
+        // This is a bit ugly but works: we leak the Arc into a global.
+        // Better: store on Bridge. But Bridge is already constructed.
+        // Let's use a once-cell pattern.
+        unsafe {
+            DEMUX_SENDERS = Some(sessions_ref);
+        }
+
         Ok(())
     }
 
@@ -98,47 +175,67 @@ impl Bridge {
         }
     }
 
-    fn take_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> { self.ws_rx.lock().unwrap().take() }
-    fn put_rx(&self, rx: mpsc::UnboundedReceiver<String>) { *self.ws_rx.lock().unwrap() = Some(rx); }
+    /// Register a per-session event channel with the WS demux thread
+    fn register_session_channel(&self, haakd_sid: &str) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded::<String>();
+        unsafe {
+            if let Some(ref senders) = DEMUX_SENDERS {
+                senders.lock().unwrap().insert(haakd_sid.to_string(), tx);
+            }
+        }
+        rx
+    }
 
-    /// Query haak.db for recent sessions
+    fn take_global_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
+        self.global_rx.lock().unwrap().take()
+    }
+
+    fn put_global_rx(&self, rx: mpsc::UnboundedReceiver<String>) {
+        *self.global_rx.lock().unwrap() = Some(rx);
+    }
+
     fn list_sessions(&self) -> Vec<SessionInfo> {
         let Some(db_path) = &self.db_path else { return Vec::new() };
         let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
             return Vec::new();
         };
         let mut stmt = match conn.prepare(
-            "SELECT display_name, agent, COALESCE(cwd, '/'), COALESCE(title, display_name), last_active
-             FROM sessions WHERE state != 'dead'
+            "SELECT display_name, COALESCE(cwd, '/'), COALESCE(title, display_name), last_active
+             FROM sessions WHERE state NOT IN ('dead','ended')
              ORDER BY last_active DESC LIMIT 20"
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        });
-        let Ok(rows) = rows else { return Vec::new() };
-        rows.filter_map(|r| r.ok())
-            .map(|(name, _agent, cwd, title, updated)| {
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+        }).ok().map(|rows| {
+            rows.filter_map(|r| r.ok()).map(|(name, cwd, title, updated)| {
                 let mut info = SessionInfo::new(name, PathBuf::from(cwd));
                 info.title = Some(title);
                 info.updated_at = updated;
                 info
-            })
-            .collect()
+            }).collect()
+        }).unwrap_or_default()
+    }
+}
+
+static mut DEMUX_SENDERS: Option<Arc<StdMutex<HashMap<String, mpsc::UnboundedSender<String>>>>> = None;
+
+// ── Helpers ──
+
+/// Truncate a string safely at a char boundary
+fn safe_truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max { return s; }
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
     }
 }
 
 fn agent_config(db_path: &Option<PathBuf>, current: &str) -> Option<SessionConfigOption> {
-    let db_path = db_path.as_ref()?;
-    let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = rusqlite::Connection::open_with_flags(db_path.as_ref()?, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let mut stmt = conn.prepare(
         "SELECT name FROM agents WHERE status='active' AND name NOT IN ('CLAUDE','claude','claude-expert','auditor') ORDER BY name"
     ).ok()?;
@@ -148,23 +245,19 @@ fn agent_config(db_path: &Option<PathBuf>, current: &str) -> Option<SessionConfi
     }).ok()?.filter_map(|r| r.ok()).collect();
     if agents.is_empty() { return None; }
     Some(SessionConfigOption::new(
-        "agent",
-        "Agent",
+        "agent", "Agent",
         SessionConfigKind::Select(SessionConfigSelect::new(current.to_string(), agents)),
     ))
 }
 
-fn thinking_effort_config() -> SessionConfigOption {
-    let options = vec![
-        SessionConfigSelectOption::new("low", "Low").description("Fast, less reasoning"),
-        SessionConfigSelectOption::new("medium", "Medium").description("Balanced"),
-        SessionConfigSelectOption::new("high", "High").description("Deep reasoning"),
-    ];
-    SessionConfigOption::new(
-        "thinking_effort",
-        "Thinking Effort",
-        SessionConfigKind::Select(SessionConfigSelect::new("medium", options)),
-    )
+fn thinking_effort_config(current: &str) -> SessionConfigOption {
+    SessionConfigOption::new("thinking_effort", "Thinking Effort", SessionConfigKind::Select(
+        SessionConfigSelect::new(current.to_string(), vec![
+            SessionConfigSelectOption::new("low", "Low").description("Fast, less reasoning"),
+            SessionConfigSelectOption::new("medium", "Medium").description("Balanced"),
+            SessionConfigSelectOption::new("high", "High").description("Deep reasoning"),
+        ]),
+    ))
 }
 
 fn model_modes() -> Vec<SessionMode> {
@@ -176,41 +269,13 @@ fn model_modes() -> Vec<SessionMode> {
 }
 
 fn mode_to_model(mode_id: &str) -> &str {
-    match mode_id {
-        "opus" => "claude-opus-4-8",
-        "haiku" => "claude-haiku-3-5",
-        _ => "claude-sonnet-4-6",
-    }
+    match mode_id { "opus" => "claude-opus-4-8", "haiku" => "claude-haiku-3-5", _ => "claude-sonnet-4-6" }
 }
 
-struct SessionCreated {
-    id: String,
-    name: String,
-    agent: String,
+fn context_window(model: &str) -> u64 {
+    if model.contains("opus") { 200_000 } else if model.contains("haiku") { 200_000 } else { 200_000 }
 }
 
-/// Wait for session.created from haakd, return session info
-async fn wait_for_session(rx: &mut mpsc::UnboundedReceiver<String>) -> Result<SessionCreated, acp::Error> {
-    while let Some(raw) = rx.next().await {
-        eprintln!("[bridge] ws: {}", &raw[..150.min(raw.len())]);
-        if let Ok(msg) = serde_json::from_str::<Value>(&raw) {
-            let t = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if t == "session.created" {
-                return Ok(SessionCreated {
-                    id: msg.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    name: msg.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    agent: msg.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                });
-            }
-            if t == "error" {
-                return Err(acp::Error::internal_error());
-            }
-        }
-    }
-    Err(acp::Error::internal_error())
-}
-
-/// Translate a haakd display event into an ACP SessionUpdate
 fn translate_event(msg: &Value) -> Option<SessionUpdate> {
     let t = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match t {
@@ -245,47 +310,76 @@ fn translate_event(msg: &Value) -> Option<SessionUpdate> {
             fields.status = Some(st);
             Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_string(), fields)))
         }
-        "permission" => None, // handled specially in prompt loop via RequestPermissionRequest
+        "permission" => None, // handled via RequestPermissionRequest in prompt loop
         "board.post" => {
             let agent = msg.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let scope = msg.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-            let text = format!("📋 **{agent}** → {scope}: {content}");
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))))
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                format!("**{agent}** posted to {scope}: {content}")
+            ))))
         }
         "job.update" => {
             let title = msg.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let status = msg.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let text = format!("⚙ Job '{title}' → {status}");
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))))
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                format!("Job '{title}' changed to {status}")
+            ))))
         }
         "agent.lifecycle" => {
             let agent = msg.get("agent").and_then(|v| v.as_str()).unwrap_or("");
             let event = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            let text = format!("👤 {agent} {event}");
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))))
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(
+                format!("{agent} {event}")
+            ))))
         }
         "notification" | "alert" => {
             let text = msg.get("text").or(msg.get("message")).and_then(|v| v.as_str()).unwrap_or("");
             if text.is_empty() { return None; }
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(format!("🔔 {text}")))))
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text.to_string()))))
         }
         _ => None,
     }
 }
 
-fn is_terminal_event(t: &str) -> bool {
-    matches!(t, "turn_done" | "session.ended" | "error")
+/// Wait for session.created from haakd on the global channel, with timeout
+async fn wait_for_session(rx: &mut mpsc::UnboundedReceiver<String>) -> Result<(String, String, String), acp::Error> {
+    // 15 second timeout
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(acp::Error::internal_error().data("Timeout waiting for haakd session.created"));
+        }
+        match futures::future::poll_fn(|cx| rx.poll_next_unpin(cx)).await {
+            Some(raw) => {
+                if let Ok(msg) = serde_json::from_str::<Value>(&raw) {
+                    let t = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "session.created" {
+                        let sid = msg.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = msg.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let agent = msg.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        return Ok((sid, name, agent));
+                    }
+                    if t == "error" {
+                        let msg = msg.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        return Err(acp::Error::internal_error().data(msg.to_string()));
+                    }
+                    // Skip other events (session.state, etc.)
+                }
+            }
+            None => return Err(acp::Error::internal_error().data("WebSocket closed")),
+        }
+    }
 }
+
+// ── Main ──
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let args: Vec<String> = std::env::args().collect();
-    let get_arg = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
-    };
+    let get_arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
 
     let url = get_arg("--url").unwrap_or_else(|| "ws://127.0.0.1:5201".to_string());
     let agent = get_arg("--agent").unwrap_or_else(|| "bala".to_string());
@@ -295,17 +389,17 @@ async fn main() -> anyhow::Result<()> {
         p.exists().then_some(p)
     });
 
-    eprintln!("[haak-acp-bridge] url={url} agent={agent} db={}", db_path.as_ref().map(|p| p.display().to_string()).unwrap_or("none".into()));
+    eprintln!("[haak-acp-bridge] url={url} agent={agent}");
 
     let bridge = Bridge::new(&url, &agent, db_path);
     bridge.connect()?;
 
-    let b_session = bridge.clone();
-    let b_prompt = bridge.clone();
-    let b_mode = bridge.clone();
-    let b_config = bridge.clone();
-    let b_list = bridge.clone();
-    let b_resume = bridge.clone();
+    let b1 = bridge.clone();
+    let b2 = bridge.clone();
+    let b3 = bridge.clone();
+    let b4 = bridge.clone();
+    let b5 = bridge.clone();
+    let b6 = bridge.clone();
 
     Agent
         .builder()
@@ -313,49 +407,59 @@ async fn main() -> anyhow::Result<()> {
 
         // ── Initialize ──
         .on_receive_request(
-            async move |_req: InitializeRequest, responder, _connection| {
+            async move |_req: InitializeRequest, responder, _cx| {
                 eprintln!("[bridge] initialize");
                 let mut caps = AgentCapabilities::new()
                     .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
                 caps.session_capabilities = SessionCapabilities::new()
                     .list(SessionListCapabilities::new())
                     .resume(SessionResumeCapabilities::new());
-                responder.respond(
-                    InitializeResponse::new(ProtocolVersion::LATEST).agent_capabilities(caps),
-                )
+                responder.respond(InitializeResponse::new(ProtocolVersion::LATEST).agent_capabilities(caps))
             },
             on_receive_request!(),
         )
 
         // ── New Session ──
         .on_receive_request(
-            async move |req: NewSessionRequest, responder, _connection| {
-                let b = &b_session;
-                let agent = b.current_agent.lock().unwrap().clone();
-                let model_key = b.current_model.lock().unwrap().clone();
+            async move |req: NewSessionRequest, responder, _cx| {
+                let b = &b1;
+                let agent = b.default_agent.clone();
+                let model_key = b.default_model.clone();
                 let model = mode_to_model(&model_key);
                 let cwd = req.cwd.display().to_string();
-                eprintln!("[bridge] new_session agent={agent} model={model} cwd={cwd}");
+                eprintln!("[bridge] new_session agent={agent} model={model} cwd={}", safe_truncate(&cwd, 60));
 
-                b.send(&json!({
-                    "type": "session.create",
-                    "agent": agent,
-                    "model": model,
-                    "cwd": cwd,
-                }).to_string());
+                b.send(&json!({"type":"session.create","agent":agent,"model":model,"cwd":cwd}).to_string());
 
-                let mut rx = b.take_rx().ok_or_else(|| acp::Error::internal_error())?;
-                let created = wait_for_session(&mut rx).await?;
-                b.put_rx(rx);
-                *b.haakd_session_id.lock().unwrap() = Some(created.id.clone());
-                eprintln!("[bridge] session: {} ({})", created.name, created.agent);
+                let mut rx = b.take_global_rx().ok_or_else(|| acp::Error::internal_error())?;
+                let (haakd_sid, name, actual_agent) = wait_for_session(&mut rx).await?;
+                b.put_global_rx(rx);
+
+                if haakd_sid.is_empty() {
+                    return Err(acp::Error::internal_error().data("Empty session ID"));
+                }
+
+                // Register per-session event channel with the demux
+                let session_rx = b.register_session_channel(&haakd_sid);
+
+                // Map ACP SessionId → haakd session ID
+                let acp_sid = SessionId::new(haakd_sid.clone());
+                b.session_map.lock().unwrap().insert(acp_sid.to_string(), haakd_sid.clone());
+                b.sessions.lock().unwrap().insert(haakd_sid.clone(), SessionState {
+                    haakd_id: haakd_sid,
+                    event_rx: session_rx,
+                    model: model_key.clone(),
+                    agent: actual_agent.clone(),
+                });
+
+                eprintln!("[bridge] session: {name} ({actual_agent})");
 
                 let mode_state = SessionModeState::new(model_key, model_modes());
-                let mut response = NewSessionResponse::new(SessionId::new(created.id));
+                let mut response = NewSessionResponse::new(acp_sid);
                 response.modes = Some(mode_state);
-                let mut configs = vec![thinking_effort_config()];
-                if let Some(agent_cfg) = agent_config(&b.db_path, &agent) {
-                    configs.insert(0, agent_cfg);
+                let mut configs = vec![thinking_effort_config("medium")];
+                if let Some(ac) = agent_config(&b.db_path, &actual_agent) {
+                    configs.insert(0, ac);
                 }
                 response.config_options = Some(configs);
                 responder.respond(response)
@@ -365,10 +469,9 @@ async fn main() -> anyhow::Result<()> {
 
         // ── List Sessions ──
         .on_receive_request(
-            async move |_req: ListSessionsRequest, responder: acp::Responder<ListSessionsResponse>, _connection| {
-                eprintln!("[bridge] list_sessions");
-                let sessions = b_list.list_sessions();
-                eprintln!("[bridge] found {} sessions", sessions.len());
+            async move |_req: ListSessionsRequest, responder: acp::Responder<ListSessionsResponse>, _cx| {
+                let sessions = b2.list_sessions();
+                eprintln!("[bridge] list_sessions: {} found", sessions.len());
                 responder.respond(ListSessionsResponse::new(sessions))
             },
             on_receive_request!(),
@@ -376,50 +479,70 @@ async fn main() -> anyhow::Result<()> {
 
         // ── Resume Session ──
         .on_receive_request(
-            async move |req: ResumeSessionRequest, responder, _connection| {
+            async move |req: ResumeSessionRequest, responder, _cx| {
                 let sid = req.session_id.to_string();
-                eprintln!("[bridge] resume session: {sid}");
-
-                let b = &b_resume;
+                eprintln!("[bridge] resume: {sid}");
+                let b = &b3;
                 b.send(&json!({"type":"session.attach","sessionId":sid}).to_string());
 
-                // Wait for session info from haakd
-                let mut rx = b.take_rx().ok_or_else(|| acp::Error::internal_error())?;
-                let created = wait_for_session(&mut rx).await.unwrap_or(SessionCreated {
-                    id: sid.clone(), name: sid.clone(), agent: "bala".into(),
-                });
-                b.put_rx(rx);
-                let resumed_sid = created.id;
+                let mut rx = b.take_global_rx().ok_or_else(|| acp::Error::internal_error())?;
+                let (haakd_sid, _, _) = wait_for_session(&mut rx).await
+                    .unwrap_or((sid.clone(), sid.clone(), "bala".into()));
+                b.put_global_rx(rx);
 
-                let mode_state = SessionModeState::new(
-                    b.current_model.lock().unwrap().clone(),
-                    model_modes(),
-                );
+                let session_rx = b.register_session_channel(&haakd_sid);
+                let acp_sid = SessionId::new(haakd_sid.clone());
+                b.session_map.lock().unwrap().insert(acp_sid.to_string(), haakd_sid.clone());
+                b.sessions.lock().unwrap().insert(haakd_sid.clone(), SessionState {
+                    haakd_id: haakd_sid,
+                    event_rx: session_rx,
+                    model: b.default_model.clone(),
+                    agent: b.default_agent.clone(),
+                });
+
+                let mode_state = SessionModeState::new(b.default_model.clone(), model_modes());
                 responder.respond(ResumeSessionResponse::new().modes(mode_state))
             },
             on_receive_request!(),
         )
 
-        // ── Set Mode (model switch) ──
+        // ── Set Mode (model) ──
         .on_receive_request(
-            async move |req: SetSessionModeRequest, responder: acp::Responder<SetSessionModeResponse>, _connection| {
+            async move |req: SetSessionModeRequest, responder: acp::Responder<SetSessionModeResponse>, _cx| {
                 let mode_id = req.mode_id.to_string();
                 eprintln!("[bridge] set_mode: {mode_id}");
-                *b_mode.current_model.lock().unwrap() = mode_id.clone();
+                let b = &b4;
 
-                // Tell haakd to reconfigure the live session with the new model
-                let hsid = b_mode.haakd_session_id.lock().unwrap().clone().unwrap_or_default();
-                if !hsid.is_empty() {
+                // Update per-session model
+                let haakd_sid = b.session_map.lock().unwrap().get(&req.session_id.to_string()).cloned();
+                if let Some(ref hsid) = haakd_sid {
+                    if let Some(sess) = b.sessions.lock().unwrap().get_mut(hsid) {
+                        sess.model = mode_id.clone();
+                    }
                     let model = mode_to_model(&mode_id);
-                    b_mode.send(&json!({
-                        "type": "session.reconfigure",
-                        "sessionId": hsid,
-                        "model": model,
-                    }).to_string());
-                    eprintln!("[bridge] reconfigure: {model}");
+                    b.send(&json!({"type":"session.reconfigure","sessionId":hsid,"model":model}).to_string());
                 }
 
                 responder.respond(SetSessionModeResponse::new())
+            },
+            on_receive_request!(),
+        )
+
+        // ── Set Config (agent / thinking effort) ──
+        .on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder: acp::Responder<SetSessionConfigOptionResponse>, _cx| {
+                let config_id = req.config_id.to_string();
+                eprintln!("[bridge] set_config: {config_id}");
+                let b = &b5;
+
+                // For now, return the current configs unchanged
+                // TODO: extract value from req, update session state, send reconfigure
+                let current_agent = b.default_agent.clone();
+                let mut configs = vec![thinking_effort_config("medium")];
+                if let Some(ac) = agent_config(&b.db_path, &current_agent) {
+                    configs.insert(0, ac);
+                }
+                responder.respond(SetSessionConfigOptionResponse::new(configs))
             },
             on_receive_request!(),
         )
@@ -435,88 +558,93 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                let b = &b_prompt;
-                let hsid = b.haakd_session_id.lock().unwrap().clone().unwrap_or_default();
-                eprintln!("[bridge] prompt sid={} len={}", &hsid[..8.min(hsid.len())], text.len());
-                b.send(&json!({"type":"user.message","sessionId":hsid,"text":text}).to_string());
+                let b = &b6;
+                let acp_sid = req.session_id.to_string();
+                let haakd_sid = b.session_map.lock().unwrap().get(&acp_sid).cloned()
+                    .unwrap_or_default();
 
-                let mut rx = b.take_rx().ok_or_else(|| acp::Error::internal_error())?;
+                if haakd_sid.is_empty() {
+                    return Err(acp::Error::internal_error().data("No haakd session for this thread"));
+                }
+
+                eprintln!("[bridge] prompt sid={} len={}", safe_truncate(&haakd_sid, 8), text.len());
+                b.send(&json!({"type":"user.message","sessionId":haakd_sid,"text":text}).to_string());
+
+                // Take this session's event receiver
+                let mut rx = {
+                    let mut sessions = b.sessions.lock().unwrap();
+                    match sessions.get_mut(&haakd_sid) {
+                        Some(sess) => {
+                            // Swap out the receiver — we'll put it back after the turn
+                            let (placeholder_tx, placeholder_rx) = mpsc::unbounded();
+                            drop(placeholder_tx);
+                            std::mem::replace(&mut sess.event_rx, placeholder_rx)
+                        }
+                        None => return Err(acp::Error::internal_error().data("Session not found")),
+                    }
+                };
+
                 let session_id = req.session_id.clone();
+                let mut stop = StopReason::EndTurn;
 
-                let mut stop_reason = StopReason::EndTurn;
                 loop {
-                    let raw = match rx.next().await { Some(r) => r, None => break };
+                    let raw = match rx.next().await { Some(r) => r, None => {
+                        eprintln!("[bridge] session stream ended");
+                        break;
+                    }};
                     let msg = match serde_json::from_str::<Value>(&raw) { Ok(m) => m, Err(_) => continue };
                     let t = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                     if t == "permission" {
-                        // Permission prompt — send RequestPermissionRequest to Zed
                         let rid = msg.get("request_id").and_then(|v| v.as_str()).unwrap_or("perm").to_string();
                         let tool = msg.get("tool").and_then(|v| v.as_str()).unwrap_or("tool").to_string();
                         let desc = msg.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        eprintln!("[bridge] permission: {tool} — {desc}");
+                        eprintln!("[bridge] permission: {tool}");
 
-                        let tool_call_id = format!("perm-{rid}");
+                        let tc_id = format!("perm-{rid}");
                         let mut fields = ToolCallUpdateFields::new();
                         fields.title = Some(format!("{tool}: {desc}"));
                         fields.status = Some(ToolCallStatus::Pending);
-                        let tc_update = ToolCallUpdate::new(tool_call_id.clone(), fields);
-
-                        let options = vec![
-                            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
-                            PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
-                        ];
 
                         let perm_req = RequestPermissionRequest::new(
-                            session_id.clone(), tc_update, options,
+                            session_id.clone(),
+                            ToolCallUpdate::new(tc_id, fields),
+                            vec![
+                                PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                                PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+                            ],
                         );
 
-                        // Send request to Zed — use channel to get result back
-                        let haakd_sid = hsid.clone();
                         let bridge_ref = b.clone();
+                        let hsid = haakd_sid.clone();
                         let rid_clone = rid.clone();
-                        let result = connection.send_request(perm_req).on_receiving_result(async move |result| {
+                        let _ = connection.send_request(perm_req).on_receiving_result(async move |result| {
                             let behavior = match result {
                                 Ok(resp) => match resp.outcome {
                                     RequestPermissionOutcome::Selected(sel) => {
                                         if sel.option_id.to_string() == "allow" { "allow" } else { "deny" }
                                     }
-                                    RequestPermissionOutcome::Cancelled => "deny",
                                     _ => "deny",
                                 },
                                 Err(_) => "deny",
                             };
-                            eprintln!("[bridge] permission response: {behavior}");
+                            eprintln!("[bridge] permission: {behavior}");
                             bridge_ref.send(&json!({
-                                "type": "permission.response",
-                                "sessionId": haakd_sid,
-                                "requestId": rid_clone,
-                                "behavior": behavior,
+                                "type":"permission.response","sessionId":hsid,
+                                "requestId":rid_clone,"behavior":behavior,
                             }).to_string());
                             Ok(())
                         });
-                        if let Err(e) = result {
-                            eprintln!("[bridge] permission send failed: {e}");
-                            b.send(&json!({
-                                "type": "permission.response",
-                                "sessionId": hsid,
-                                "requestId": rid,
-                                "behavior": "allow",
-                            }).to_string());
-                        }
                         continue;
                     }
 
                     if t == "turn_done" {
-                        // Extract usage stats and send as UsageUpdate
                         let input = msg.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                         let output = msg.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                         let cost_val = msg.get("total_cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         if input + output > 0 {
-                            let mut usage = UsageUpdate::new(input + output, 200_000); // approximate context window
-                            if cost_val > 0.0 {
-                                usage.cost = Some(Cost::new(cost_val, "USD"));
-                            }
+                            let mut usage = UsageUpdate::new(input + output, context_window(""));
+                            if cost_val > 0.0 { usage.cost = Some(Cost::new(cost_val, "USD")); }
                             let _ = connection.send_notification(SessionNotification::new(
                                 session_id.clone(), SessionUpdate::UsageUpdate(usage),
                             ));
@@ -525,42 +653,29 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if t == "session.ended" { break; }
                     if t == "error" {
-                        stop_reason = StopReason::EndTurn; // could map to error stop
+                        eprintln!("[bridge] error: {:?}", msg.get("message"));
+                        stop = StopReason::EndTurn; // TODO: map to error stop when ACP supports it
                         break;
                     }
 
                     if let Some(update) = translate_event(&msg) {
-                        connection.send_notification(SessionNotification::new(session_id.clone(), update))?;
+                        let _ = connection.send_notification(SessionNotification::new(session_id.clone(), update));
                     }
                 }
 
-                b.put_rx(rx);
-                responder.respond(PromptResponse::new(stop_reason))
-            },
-            on_receive_request!(),
-        )
-
-        // ── Set Config Option (agent / thinking effort) ──
-        .on_receive_request(
-            async move |req: SetSessionConfigOptionRequest, responder: acp::Responder<SetSessionConfigOptionResponse>, _connection| {
-                let config_id = req.config_id.to_string();
-                eprintln!("[bridge] set_config: {config_id} = {:?}", req);
-                // Return updated config list
-                let mut configs = vec![thinking_effort_config()];
-                if let Some(agent_cfg) = agent_config(&b_config.db_path, &b_config.current_agent.lock().unwrap()) {
-                    configs.insert(0, agent_cfg);
+                // Put the receiver back
+                if let Some(sess) = b.sessions.lock().unwrap().get_mut(&haakd_sid) {
+                    sess.event_rx = rx;
                 }
-                responder.respond(SetSessionConfigOptionResponse::new(configs))
+
+                responder.respond(PromptResponse::new(stop))
             },
             on_receive_request!(),
         )
 
         // ── Cancel ──
         .on_receive_notification(
-            async move |_notif: CancelNotification, _connection| {
-                eprintln!("[bridge] cancel");
-                Ok(())
-            },
+            async move |_notif: CancelNotification, _cx| { eprintln!("[bridge] cancel"); Ok(()) },
             on_receive_notification!(),
         )
 
@@ -572,9 +687,7 @@ async fn main() -> anyhow::Result<()> {
             },
             on_receive_dispatch!(),
         )
-        .connect_to(Stdio::new().with_debug(|line, dir| {
-            eprintln!("[acp {dir:?}] {}", &line[..300.min(line.len())]);
-        }))
+        .connect_to(Stdio::new())
         .await?;
 
     Ok(())
